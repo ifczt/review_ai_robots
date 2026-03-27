@@ -1,0 +1,16 @@
+# 多地区数据库连接示例
+# 格式：mysql://用户名:密码@主机:端口/数据库名
+
+[sa]
+system = "mysql://username:password@db.example.com:3306/system"
+user = "mysql://username:password@db.example.com:3306/user"
+statistics = "mysql://username:password@db.example.com:3306/statistics"
+customer_service = "mysql://username:password@db.example.com:3306/customer_service"
+
+[mx]
+system = "mysql://username:password@db.example.com:3306/system"
+user = "mysql://username:password@db.example.com:3306/user"
+
+[sg]
+system = "mysql://username:password@db.example.com:3306/system"
+user = "mysql://username:password@db.example.com:3306/user"

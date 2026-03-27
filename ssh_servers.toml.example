@@ -1,0 +1,19 @@
+# SSH 运维服务器连接示例
+
+[sa]
+host = "ops.example.com"
+port = 22
+user = "ubuntu"
+key_path = "IFCZT_KEYS"
+
+[mx]
+host = "ops.example.com"
+port = 22
+user = "ubuntu"
+key_path = "IFCZT_KEYS"
+
+[sg]
+host = "ops.example.com"
+port = 22
+user = "ubuntu"
+key_path = "IFCZT_KEYS"
