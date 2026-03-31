@@ -116,8 +116,18 @@ def execute(cmd: str, region: str, timeout: int = 30) -> tuple[int, str]:
     with _lock:
         client = _connect(region)
 
+    # 如果命令以 sudo 开头且配置了 sudo_password，改用 sudo -S 并写入密码
+    cfg = _get_config().get(region, {})
+    sudo_password = cfg.get("sudo_password", "")
+    if sudo_password and cmd.startswith("sudo ") and "sudo -S " not in cmd:
+        cmd = "sudo -S " + cmd[5:]
+
     logger.info("[ssh] %s 执行: %r", region, cmd[:200])
     stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+
+    if sudo_password and cmd.startswith("sudo -S "):
+        stdin.write(sudo_password + "\n")
+        stdin.flush()
     stdin.close()
 
     out = stdout.read().decode("utf-8", errors="replace")

@@ -19,6 +19,17 @@ ALLOWED_SUPERVISORCTL_SUBCMDS = {
     "reload", "reread", "update",
 }
 
+# nginx 允许的操作名 → 实际命令（均加 sudo）
+NGINX_ACTION_COMMANDS = {
+    "status":     "systemctl status nginx",
+    "start":      "systemctl start nginx",
+    "stop":       "systemctl stop nginx",
+    "restart":    "systemctl restart nginx",
+    "reload":     "nginx -s reload",
+    "test":       "nginx -t",
+    "configtest": "nginx -t",
+}
+
 # 允许远程执行的命令白名单
 ALLOWED_COMMANDS = {
     # 诊断/查看
@@ -30,6 +41,7 @@ ALLOWED_COMMANDS = {
     "echo", "which",
     # 进程/服务管理
     "supervisorctl",
+    "nginx",
     "systemctl", "journalctl",
     # 日志
     "journalctl",
@@ -96,6 +108,24 @@ def execute(cmd_text: str, region: str) -> str:
                 subcmd, ", ".join(sorted(ALLOWED_SUPERVISORCTL_SUBCMDS))
             )
         cmd_text = "sudo " + cmd_text
+
+    # nginx 操作映射，并自动加 sudo
+    if base_cmd == "nginx":
+        action = parts[1] if len(parts) > 1 else "status"
+        if action not in NGINX_ACTION_COMMANDS:
+            return "nginx `{}` 不在允许的操作列表中。允许：{}".format(
+                action, ", ".join(sorted(NGINX_ACTION_COMMANDS))
+            )
+        # reload / restart 前必须先通过配置检测
+        if action in ("reload", "restart"):
+            logger.info("[remote_executor] region=%s nginx %s 前先执行 nginx -t", region, action)
+            try:
+                test_rc, test_out = ssh.execute("sudo nginx -t", region, timeout=settings.cmd_timeout_seconds)
+            except Exception as e:
+                return f"nginx -t 执行失败：{e}"
+            if test_rc != 0:
+                return "nginx 配置检测失败，已取消 {}，请先修复配置：\n\n{}".format(action, test_out)
+        cmd_text = "sudo " + NGINX_ACTION_COMMANDS[action]
 
     logger.info("[remote_executor] region=%s 执行: %s", region, cmd_text[:200])
 

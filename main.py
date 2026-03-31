@@ -5,7 +5,7 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 # 必须在所有业务模块导入前初始化，否则模块级日志（如 test_plan._load_sessions）会丢失
 logging.basicConfig(
@@ -115,16 +115,27 @@ def _process(text: str, chat_id: str, user_id: str, is_bw_group: bool = False) -
 
 
 def _daily_report_scheduler() -> None:
-    """后台线程：每天 21:30 发送代码审查日报。"""
-    fired_on: datetime | None = None
+    """后台线程：定时发送群日报和个人日报。"""
+    group_fired_on: date | None = None
+    private_fired_on: date | None = None
     while True:
         now = datetime.now()
-        if now.hour == 21 and now.minute == 30 and (fired_on is None or fired_on.date() != now.date()):
-            fired_on = now
+        if now.hour == 21 and now.minute == 30 and group_fired_on != now.date():
+            group_fired_on = now.date()
             try:
-                daily_report.send_daily_report()
+                daily_report.send_daily_report(target_date=now.date())
             except Exception as e:
-                logger.exception("[scheduler] 日报发送失败: %s", e)
+                logger.exception("[scheduler] 群日报发送失败: %s", e)
+        if (
+            now.hour == settings.daily_report_send_hour
+            and now.minute == settings.daily_report_send_minute
+            and private_fired_on != now.date()
+        ):
+            private_fired_on = now.date()
+            try:
+                daily_report.send_default_private_daily_reports(base_date=now.date())
+            except Exception as e:
+                logger.exception("[scheduler] 个人日报发送失败: %s", e)
         time.sleep(60)  # 每分钟检查一次，保证同一分钟只触发一次
 
 
@@ -132,7 +143,12 @@ def main():
     _acquire_single_instance_lock()
 
     threading.Thread(target=_daily_report_scheduler, daemon=True, name="daily-report").start()
-    logger.info("[bot] 日报调度器已启动（每天 21:30）")
+    logger.info(
+        "[bot] 日报调度器已启动（群日报 21:30；个人日报 %02d:%02d，回看 %d 天）",
+        settings.daily_report_send_hour,
+        settings.daily_report_send_minute,
+        settings.daily_report_lookback_days,
+    )
 
     handler = (
         lark.EventDispatcherHandler.builder("", "", lark.LogLevel.DEBUG)

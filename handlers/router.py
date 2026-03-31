@@ -24,8 +24,10 @@ HELP_TEXT = """可用命令：
 /freeze                           - 查看封版状态
 /testlist                         - 查询当前所有待测试任务（上线前确认）
 /svc <地区> <子命令> [服务名]     - 远程管理 supervisor 服务进程
+/svc <地区> nginx <操作>          - 远程管理 nginx（操作：status/start/stop/restart/reload/test）
 /run <命令>                       - 执行本地系统命令（仅限只读/诊断类）
 /report                           - 立即发送今日代码审查日报
+/preport                          - 立即发送个人日报（默认发送昨天）
 /clear                            - 清除对话历史
 /help                             - 显示此帮助
 
@@ -35,6 +37,9 @@ HELP_TEXT = """可用命令：
   /svc sa status
   /svc sa restart grpc_notice_hook
   /svc sa tail grpc_notice_hook
+  /svc sa nginx status
+  /svc sa nginx reload
+  /svc sa nginx test
 
 直接发送 SQL 语句时，需包含地区前缀，例如：
   sa.user: SELECT * FROM users LIMIT 10
@@ -139,15 +144,20 @@ def dispatch(text: str, chat_id: str, user_id: str) -> None:
             send_text(chat_id, _freeze.status_text())
         return
 
-    # ── /svc 命令（远程 supervisorctl）─────────────────────────
+    # ── /svc 命令（远程 supervisorctl / nginx）─────────────────
     if stripped.startswith("/svc "):
         args = stripped[5:].strip().split(None, 1)
         if len(args) < 2:
             send_text(chat_id, (
-                "用法：/svc <地区> <子命令> [服务名]\n\n"
+                "用法：\n"
+                "  /svc <地区> <子命令> [服务名]     - supervisorctl\n"
+                "  /svc <地区> nginx <操作>           - nginx 管理\n\n"
+                "nginx 操作：status / start / stop / restart / reload / test\n\n"
                 "示例：\n"
                 "  /svc sa status\n"
-                "  /svc sa restart grpc_notice_hook\n\n"
+                "  /svc sa restart grpc_notice_hook\n"
+                "  /svc sa nginx status\n"
+                "  /svc sa nginx reload\n\n"
                 + _ssh.format_available()
             ))
             return
@@ -156,12 +166,23 @@ def dispatch(text: str, chat_id: str, user_id: str) -> None:
             send_text(chat_id, f"未知地区：{region}\n\n" + _ssh.format_available())
             return
         logger.info("[router] /svc region=%s subcmd=%r user=%s", region, subcmd, user_id)
-        result = remote_executor.execute("supervisorctl " + subcmd, region)
+        # 判断是 nginx 还是 supervisorctl
+        svc_parts = subcmd.split(None, 1)
+        if svc_parts[0].lower() == "nginx":
+            nginx_action = svc_parts[1] if len(svc_parts) > 1 else "status"
+            result = remote_executor.execute(f"nginx {nginx_action}", region)
+        else:
+            result = remote_executor.execute("supervisorctl " + subcmd, region)
         send_text(chat_id, "```\n{}\n```".format(result))
         return
 
     if stripped == "/svc":
-        send_text(chat_id, "用法：/svc <地区> <子命令> [服务名]\n\n" + _ssh.format_available())
+        send_text(chat_id, (
+            "用法：\n"
+            "  /svc <地区> <子命令> [服务名]     - supervisorctl\n"
+            "  /svc <地区> nginx <操作>           - nginx 管理\n\n"
+            + _ssh.format_available()
+        ))
         return
 
     # ── /run 命令 ───────────────────────────────────────────────
@@ -191,6 +212,13 @@ def dispatch(text: str, chat_id: str, user_id: str) -> None:
     if stripped == "/report":
         logger.info("[router] /report 命令 user=%s", user_id)
         daily_report.send_daily_report()
+        return
+
+    # ── /preport 命令（立即发送个人日报）──────────────────────────
+    if stripped == "/preport":
+        logger.info("[router] /preport 命令 user=%s", user_id)
+        target_date = daily_report.send_default_private_daily_reports()
+        send_text(chat_id, f"个人日报已触发发送，目标日期：{target_date.isoformat()}")
         return
 
     # ── /clear 命令 ─────────────────────────────────────────────
