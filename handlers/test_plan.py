@@ -31,7 +31,6 @@ from infra.feishu import send_text
 
 logger = logging.getLogger(__name__)
 
-_SESSION_TTL_SECONDS = 24 * 3600  # 24 小时无响应自动关闭
 _DB_PATH = app_path("data", "stats.db")
 
 # 解析 AI 输出的编号列表，兼容 "1." 和 "1、" 两种格式
@@ -151,12 +150,8 @@ def _load_sessions() -> None:
                 "SELECT * FROM test_plan_sessions WHERE rejected = 0"
             ).fetchall()
 
-        expired_ids = []
         for row in rows:
             r = dict(row)
-            if now - r["created_at"] > _SESSION_TTL_SECONDS:
-                expired_ids.append(r["session_id"])
-                continue
             session = TestPlanSession(
                 session_id=r["session_id"],
                 source_chat_id=r["source_chat_id"],
@@ -173,13 +168,9 @@ def _load_sessions() -> None:
             )
             _sessions[session.session_id] = session
 
-        # 清理数据库中已过期的记录
-        for sid in expired_ids:
-            _delete_session_db(sid)
-
         logger.info(
-            "[test_plan] 启动加载完成：恢复 %d 个活跃会话，清理 %d 个过期会话",
-            len(_sessions), len(expired_ids),
+            "[test_plan] 启动加载完成：恢复 %d 个活跃会话",
+            len(_sessions),
         )
     except Exception:
         logger.exception("[test_plan] 启动时加载会话失败")
@@ -232,7 +223,6 @@ def create_session(
     initiator_id: str = "",
 ) -> None:
     """PR 合并后调用：提取测试要点，创建会话，持久化，发送 BW 群通知。"""
-    _maybe_expire_old_sessions()
 
     if not settings.bw_chat_id:
         logger.warning("[test_plan] BW_CHAT_ID 未配置，跳过测试通知")
@@ -466,20 +456,4 @@ def _on_rejected(session: TestPlanSession, point_num: int, reason: str) -> None:
     )
 
 
-def _maybe_expire_old_sessions() -> None:
-    """清理超过 TTL 的过期会话，通知原群，并从数据库删除。"""
-    now = time.time()
-    expired = [
-        sid for sid, s in _sessions.items()
-        if now - s.created_at > _SESSION_TTL_SECONDS
-    ]
-    for sid in expired:
-        s = _sessions.pop(sid)
-        _delete_session_db(sid)
-        logger.warning(
-            "[test_plan] 会话超时自动清除 session_id=%s pr=%d", sid, s.pr_index
-        )
-        send_text(
-            s.source_chat_id,
-            f"⚠️ PR #{s.pr_index} 测试计划已超时（24小时无响应），自动关闭。",
-        )
+
