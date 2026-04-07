@@ -7,6 +7,7 @@ import re
 
 from handlers import chat, daily_report
 from handlers import test_plan as _test_plan
+from handlers import server_status as _server_status
 from handlers.reviews import git as git_review
 from handlers.reviews.sql import sql_review
 from infra import freeze as _freeze, ssh as _ssh
@@ -25,6 +26,8 @@ HELP_TEXT = """可用命令：
 /testlist                         - 查询当前所有待测试任务（上线前确认）
 /svc <地区> <子命令> [服务名]     - 远程管理 supervisor 服务进程
 /svc <地区> nginx <操作>          - 远程管理 nginx（操作：status/start/stop/restart/reload/test）
+/status                           - 查看所有地区服务器实时状态（AI 汇总）
+/status <地区>                    - 查看指定地区服务器实时状态
 /run <命令>                       - 执行本地系统命令（仅限只读/诊断类）
 /report                           - 立即发送今日代码审查日报
 /preport                          - 立即发送个人日报（默认发送昨天）
@@ -206,6 +209,15 @@ def dispatch(text: str, chat_id: str, user_id: str) -> None:
     if stripped == "/testlist":
         logger.info("[router] /testlist 命令 user=%s", user_id)
         send_text(chat_id, _test_plan.get_pending_summary())
+        return
+
+    # ── /status 命令（实时服务器状态）──────────────────────────────
+    if stripped.startswith("/status"):
+        arg = stripped[7:].strip()  # 地区参数（可选）
+        logger.info("[router] /status 命令 region=%r user=%s", arg or "all", user_id)
+        send_text(chat_id, "⏳ 正在采集服务器状态，请稍候...")
+        result = _server_status.query_status(region=arg if arg else None)
+        send_text(chat_id, result)
         return
 
     # ── /report 命令（立即发送今日日报，用于测试或按需查看）────────

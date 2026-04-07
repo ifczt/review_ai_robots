@@ -40,7 +40,18 @@ class Settings(BaseSettings):
     daily_report_private_recipients: str = ""
     daily_report_send_hour: int = 19
     daily_report_send_minute: int = 30
-    daily_report_lookback_days: int = 1
+    daily_report_lookback_days: int = 0
+
+    # 服务器状态监控
+    server_monitor_chat_id: str = ""           # 告警 & 状态汇报目标群
+    server_monitor_interval_minutes: int = 5   # 巡检间隔（分钟）
+    server_monitor_report_hour: int = 9        # 每日定时汇报小时
+    server_monitor_report_minute: int = 0      # 每日定时汇报分钟
+    server_monitor_cpu_threshold: int = 90     # CPU 告警阈值（%）
+    server_monitor_mem_threshold: int = 90     # 内存告警阈值（%）
+    server_monitor_disk_threshold: int = 85    # 磁盘告警阈值（%）
+    server_monitor_alert_cooldown_minutes: int = 30  # 同一指标告警冷却时间（分钟）
+    server_monitor_process_cpu_threshold: int = 50   # 单进程 CPU 占用告警阈值（%），0 表示不监控
 
     class Config:
         env_file = str(_ENV_FILE)

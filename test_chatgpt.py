@@ -1,120 +1,181 @@
 # -*- coding: utf-8 -*-
-"""
-Test ChatGPT API connection (Responses API format).
-Run: python test_chatgpt.py
+"""测试新的 ChatGPT 中转。
 
-需要在 .env 中填入有效的 CHATGPT_API_KEY（和可选 CHATGPT_BASE_URL）。
-使用 /v1/responses 端点 + input 数组格式。
+当前中转在非流式 `responses` 返回里不会回填 `output`，
+因此测试脚本改为用 SSE 流式事件读取最终文本。
+
+运行：
+    python test_chatgpt.py
 """
-import sys
+import json
 import os
+import sys
+
+import httpx
+from dotenv import load_dotenv
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-# Windows 控制台强制 UTF-8 输出
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from dotenv import load_dotenv
 load_dotenv(".env")
 
-import httpx
 
-# 读取配置
-api_key = os.getenv("CHATGPT_API_KEY", "")
-base_url = os.getenv("CHATGPT_BASE_URL", "")
-model = os.getenv("CHATGPT_MODEL", "gpt-5.2")
-
-if not api_key:
-    print("❌ 错误：CHATGPT_API_KEY 未配置，请在 .env 中填入有效的 API Key")
-    sys.exit(1)
-
-# 处理 base_url
-if base_url:
-    base_url = base_url.rstrip("/")
+def build_base_url() -> str:
+    base_url = os.getenv("CHATGPT_BASE_URL", "").rstrip("/")
+    if not base_url:
+        base_url = "https://api.openai.com"
     if not base_url.endswith("/v1"):
         base_url += "/v1"
-else:
-    base_url = "https://api.openai.com/v1"
+    return base_url
 
-api_url = f"{base_url}/responses"
 
-print(f"📡 ChatGPT 连接测试 (Responses API)")
-print(f"   Endpoint: {api_url}")
-print(f"   Model:    {model}")
-print(f"   API Key:  {api_key[:8]}...{api_key[-4:]}")
-print()
+def consume_sse(response: httpx.Response) -> tuple[str, dict]:
+    event_name = ""
+    data_lines: list[str] = []
+    deltas: list[str] = []
+    done_text = ""
+    completed_response = {}
+    last_payload = {}
 
-# 构建 Responses API 格式的请求
-payload = {
-    "model": model,
-    "input": [
-        {
-            "type": "message",
-            "role": "user",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": "Say 'Hello! ChatGPT is working.' in one short sentence."
-                }
-            ]
-        }
-    ]
-}
+    def flush_event() -> None:
+        nonlocal event_name, data_lines, done_text, completed_response, last_payload
 
-# 使用系统代理（trust_env=True）
-client = httpx.Client(
-    trust_env=True,
-    timeout=120.0,
-    headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    },
-)
+        if not data_lines:
+            event_name = ""
+            return
 
-try:
-    print("⏳ 正在发送请求...")
-    response = client.post(api_url, json=payload)
+        raw_data = "\n".join(data_lines)
+        data_lines = []
 
-    if response.status_code != 200:
-        print(f"❌ HTTP {response.status_code}")
-        # 如果是 HTML（Cloudflare 拦截），只打印前 200 字符
-        content_type = response.headers.get("content-type", "")
-        if "html" in content_type:
-            print(f"   看起来是 Cloudflare 拦截，请检查代理/VPN 设置")
-            print(f"   响应片段: {response.text[:200]}")
-        else:
-            print(f"   响应: {response.text[:500]}")
-        sys.exit(1)
+        if raw_data == "[DONE]":
+            event_name = ""
+            return
 
-    data = response.json()
-    print(f"✅ 调用成功！")
+        payload = json.loads(raw_data)
+        last_payload = payload
+        event_type = payload.get("type") or event_name
 
-    # 解析 Responses API 返回
-    output = data.get("output", [])
-    for item in output:
-        if item.get("type") == "message":
-            content = item.get("content", [])
-            for block in content:
-                if block.get("type") == "output_text":
-                    print(f"   模型返回: {block.get('text', '')}")
+        if event_type == "response.output_text.delta":
+            delta = payload.get("delta", "")
+            if delta:
+                deltas.append(delta)
+        elif event_type == "response.output_text.done":
+            done_text = payload.get("text", "") or ""
+        elif event_type == "response.completed":
+            completed_response = payload.get("response", {}) or {}
+        elif event_type == "response.failed":
+            error = payload.get("response", {}).get("error") or payload.get("error") or payload
+            raise RuntimeError(f"中转返回失败事件: {error}")
 
-    # 打印 usage 信息
-    usage = data.get("usage", {})
-    if usage:
-        print(f"   Usage:   input_tokens={usage.get('input_tokens', '?')}, "
-              f"output_tokens={usage.get('output_tokens', '?')}")
+        event_name = ""
 
-    print(f"\n   完整响应 ID: {data.get('id', '?')}")
-    print(f"   模型: {data.get('model', '?')}")
+    for raw_line in response.iter_lines():
+        if raw_line is None:
+            continue
 
-except httpx.ConnectError as e:
-    print(f"❌ 连接失败: {e}")
-    print(f"   请检查网络连接和代理设置")
-    sys.exit(1)
-except Exception as e:
-    print(f"❌ 调用失败: {type(e).__name__}: {e}")
-    sys.exit(1)
-finally:
-    client.close()
+        line = raw_line.strip()
+        if not line:
+            flush_event()
+            continue
+
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+            continue
+
+        if line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+
+    flush_event()
+    return done_text or "".join(deltas), completed_response or last_payload
+
+
+def main() -> int:
+    api_key = os.getenv("CHATGPT_API_KEY", "")
+    model = os.getenv("CHATGPT_MODEL", "gpt-4o")
+    max_tokens = int(os.getenv("CHATGPT_MAX_TOKENS", "4096") or "4096")
+    api_url = f"{build_base_url()}/responses"
+
+    if not api_key:
+        print("❌ 错误：CHATGPT_API_KEY 未配置")
+        return 1
+
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "请只回复一句短话：Hello! ChatGPT relay is working.",
+                    }
+                ],
+            }
+        ],
+        "max_output_tokens": max_tokens,
+        "stream": True,
+    }
+
+    print("📡 ChatGPT 新中转连接测试")
+    print(f"   Endpoint: {api_url}")
+    print(f"   Model:    {model}")
+    print(f"   API Key:  {api_key[:8]}...{api_key[-4:]}")
+    print("   Mode:     Responses API + SSE")
+    print()
+
+    with httpx.Client(
+        trust_env=True,
+        timeout=120.0,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    ) as client:
+        try:
+            print("⏳ 正在发送流式请求...")
+            with client.stream("POST", api_url, json=payload) as response:
+                response.raise_for_status()
+                text, data = consume_sse(response)
+
+            if not text.strip():
+                print("❌ 调用成功，但流式事件里没有正文")
+                print(f"   原始 completed 响应: {json.dumps(data, ensure_ascii=False)[:1000]}")
+                return 1
+
+            print("✅ 调用成功！")
+            print(f"   模型返回: {text}")
+
+            usage = data.get("usage", {})
+            if usage:
+                print(
+                    "   Usage:   input_tokens={}, output_tokens={}, total_tokens={}".format(
+                        usage.get("input_tokens", "?"),
+                        usage.get("output_tokens", "?"),
+                        usage.get("total_tokens", "?"),
+                    )
+                )
+
+            print(f"   响应 ID:  {data.get('id', '?')}")
+            print(f"   状态:     {data.get('status', '?')}")
+            print(f"   模型:     {data.get('model', '?')}")
+            return 0
+
+        except httpx.HTTPStatusError as exc:
+            print(f"❌ HTTP {exc.response.status_code}")
+            print(f"   响应: {exc.response.text[:800]}")
+            return 1
+        except httpx.ConnectError as exc:
+            print(f"❌ 连接失败: {exc}")
+            print("   请检查网络、代理或中转地址")
+            return 1
+        except Exception as exc:
+            print(f"❌ 调用失败: {type(exc).__name__}: {exc}")
+            return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

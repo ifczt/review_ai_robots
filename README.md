@@ -12,7 +12,7 @@
 - 远程服务器 `supervisorctl` 管理和只读诊断命令
 - PR 合并后自动生成测试要点，并在 BW 群推进验收
 - 每日 21:30 自动发送团队代码审查日报
-- 每日 19:30 按指定人员私聊发送个人代码审查日报（默认汇总前一天）
+- 每日 19:30 按指定人员私聊发送个人代码审查日报（默认汇总当天）
 - 支持 Anthropic、OpenAI 兼容接口和 ChatGPT 三种 AI 后端
 
 ## 目录说明
@@ -91,7 +91,7 @@ python main.py
 | `/run <命令>` | 执行本地只读诊断命令 |
 | `/testlist` | 查看当前待测试任务 |
 | `/report` | 立即发送今日日报 |
-| `/preport` | 立即发送个人日报（默认发送昨天） |
+| `/preport` | 立即发送个人日报（默认发送今天） |
 | `/chatid` | 获取当前群 `chat_id`，方便写入配置 |
 | `/clear` | 清空当前用户对话历史 |
 | `/help` | 查看帮助 |
@@ -124,7 +124,7 @@ python main.py
 - `DAILY_REPORT_PRIVATE_RECIPIENTS`: 个人日报接收映射，JSON 格式 `{"gitea_author":"feishu_open_id"}`
 - `DAILY_REPORT_SEND_HOUR`: 个人日报发送小时，默认 `19`
 - `DAILY_REPORT_SEND_MINUTE`: 个人日报发送分钟，默认 `30`
-- `DAILY_REPORT_LOOKBACK_DAYS`: 个人日报回看天数，默认 `1`（即发送昨天日报）
+- `DAILY_REPORT_LOOKBACK_DAYS`: 个人日报回看天数，默认 `0`（即发送今日日报）
 - `SSH_KEY_PASSPHRASE`: 私钥密码，可为空
 
 ### `db_connections.toml`

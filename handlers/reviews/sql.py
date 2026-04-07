@@ -74,7 +74,21 @@ class SqlReview(ReviewBase):
         # ── ② AI 审核 ─────────────────────────────────────────
         # AI 可按需调用工具（get_table_schema / get_table_row_count / get_table_indexes）
         # 获取真实表结构，避免虚构字段名或错误估算影响行数
-        review = self._ai_review(sql, region, database)
+        try:
+            review = self._ai_review(sql, region, database)
+        except Exception as exc:
+            logger.exception(
+                "[sql_review] AI 审核失败 user=%s target=%s.%s",
+                user_id,
+                region,
+                database,
+            )
+            send_text(
+                chat_id,
+                "AI 审核失败：服务返回空响应或接口异常，请检查 AI_BACKEND / 中转配置后重试。\n"
+                f"错误：{exc}",
+            )
+            return
         logger.info("[sql_review] AI 审核完成，结论=%r", review[:80])
 
         # ── ③ 根据 AI 结论分发 ────────────────────────────────
@@ -90,7 +104,7 @@ class SqlReview(ReviewBase):
 
         else:
             # AI 未按格式响应，原样输出交人工判断
-            logger.error("[sql_review] AI 返回格式异常 user=%s review=%r", user_id, review[:200])
+            logger.error("[sql_review] AI 返回格式异常 user=%s review=%r", user_id, review)
             send_text(chat_id, "AI 审核结果如下，请负责人判断：\n\n{}".format(review))
 
     def _do_execute(self, sql: str, ctx, chat_id: str, user_id: str) -> None:

@@ -35,6 +35,7 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
 from config import settings
 from handlers import daily_report, router
+from handlers import server_status as _server_status
 
 # 已处理的消息 ID 集合（幂等去重，防止重复投递）
 _processed_message_ids: set[str] = set()
@@ -115,9 +116,10 @@ def _process(text: str, chat_id: str, user_id: str, is_bw_group: bool = False) -
 
 
 def _daily_report_scheduler() -> None:
-    """后台线程：定时发送群日报和个人日报。"""
+    """后台线程：定时发送群日报、个人日报和服务器状态汇报。"""
     group_fired_on: date | None = None
     private_fired_on: date | None = None
+    server_report_fired_on: date | None = None
     while True:
         now = datetime.now()
         if now.hour == 21 and now.minute == 30 and group_fired_on != now.date():
@@ -136,7 +138,35 @@ def _daily_report_scheduler() -> None:
                 daily_report.send_default_private_daily_reports(base_date=now.date())
             except Exception as e:
                 logger.exception("[scheduler] 个人日报发送失败: %s", e)
+        # 服务器状态每日定时汇报
+        if (
+            now.hour == settings.server_monitor_report_hour
+            and now.minute == settings.server_monitor_report_minute
+            and server_report_fired_on != now.date()
+        ):
+            server_report_fired_on = now.date()
+            try:
+                _server_status.send_daily_server_report()
+            except Exception as e:
+                logger.exception("[scheduler] 服务器日报发送失败: %s", e)
         time.sleep(60)  # 每分钟检查一次，保证同一分钟只触发一次
+
+def _server_monitor_scheduler() -> None:
+    """后台巡检线程：按配置间隔巡检所有地区服务器状态，发送 AI 汇总播报和告警。"""
+    interval_seconds = settings.server_monitor_interval_minutes * 60
+    if not settings.server_monitor_chat_id:
+        logger.info("[monitor] server_monitor_chat_id 未配置，巡检线程不启动")
+        return
+    logger.info(
+        "[monitor] 巡检调度器已启动，间隔 %d 分钟",
+        settings.server_monitor_interval_minutes,
+    )
+    while True:
+        try:
+            _server_status.send_patrol_report()
+        except Exception as e:
+            logger.exception("[monitor] 巡检异常: %s", e)
+        time.sleep(interval_seconds)
 
 
 def main():
@@ -148,6 +178,14 @@ def main():
         settings.daily_report_send_hour,
         settings.daily_report_send_minute,
         settings.daily_report_lookback_days,
+    )
+
+    threading.Thread(target=_server_monitor_scheduler, daemon=True, name="server-monitor").start()
+    logger.info(
+        "[bot] 服务器巡检调度器已启动（间隔 %d 分钟；每日汇报 %02d:%02d）",
+        settings.server_monitor_interval_minutes,
+        settings.server_monitor_report_hour,
+        settings.server_monitor_report_minute,
     )
 
     handler = (
