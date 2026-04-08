@@ -102,8 +102,13 @@ def _connect(region: str) -> paramiko.SSHClient:
         allow_agent=False,
         look_for_keys=False,
     )
+    # Keepalive：每 30 秒发送一个轻量心跳包，防止防火墙因空闲超时将连接强制断开
+    # 每包负载极小（~200 字节），对服务器几乎没有负担
+    transport = client.get_transport()
+    if transport:
+        transport.set_keepalive(30)
     _clients[region] = client
-    logger.info("[ssh] %s 连接成功", region)
+    logger.info("[ssh] %s 连接成功（keepalive=30s）", region)
     return client
 
 
@@ -137,6 +142,35 @@ def execute(cmd: str, region: str, timeout: int = 30) -> tuple[int, str]:
     combined = (out + err).strip()
     logger.debug("[ssh] %s 退出码=%d 输出长度=%d", region, rc, len(combined))
     return rc, combined
+
+
+def warm_up() -> None:
+    """
+    并发预建所有地区的 SSH 连接（启动时调用）。
+    使后续指令执行和巡检采集无需等待连接行程，减少首次超时风险。
+    并发建立连接使用多线程，减少总等待时间。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    regions = list_regions()
+    if not regions:
+        return
+
+    def _try_connect(r: str) -> tuple[str, bool]:
+        try:
+            with _lock:
+                _connect(r)
+            return r, True
+        except Exception as e:
+            logger.warning("[ssh] warm_up %s 失败: %s", r, e)
+            return r, False
+
+    logger.info("[ssh] 开始预热连接，地区数=%d", len(regions))
+    with ThreadPoolExecutor(max_workers=len(regions)) as pool:
+        futures = {pool.submit(_try_connect, r): r for r in regions}
+        for f in as_completed(futures):
+            region, ok = f.result()
+            status = "OK" if ok else "FAILED"
+            logger.info("[ssh] warm_up %s -> %s", region, status)
 
 
 def close_all() -> None:

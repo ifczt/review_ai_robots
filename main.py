@@ -172,6 +172,12 @@ def _server_monitor_scheduler() -> None:
 def main():
     _acquire_single_instance_lock()
 
+    # 启动时并发预热所有 SSH 长连接（后台线程，不阻塞启动）
+    # Keepalive=30s 已在连接时配置，防止防火墙因空闲断连
+    from infra import ssh as _ssh
+    threading.Thread(target=_ssh.warm_up, daemon=True, name="ssh-warmup").start()
+    logger.info("[bot] SSH 连接预热已在后台启动")
+
     threading.Thread(target=_daily_report_scheduler, daemon=True, name="daily-report").start()
     logger.info(
         "[bot] 日报调度器已启动（群日报 21:30；个人日报 %02d:%02d，回看 %d 天）",

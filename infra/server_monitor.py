@@ -2,20 +2,23 @@
 服务器状态监控采集器。
 
 通过 SSH 并发采集各地区运维服务器的关键指标：
-  - CPU 使用率（%）
-  - 内存使用率（%）
+  - CPU 使用率（%）—— 读 /proc/stat 两次差值，比 top 稳定
+  - 内存使用率（%）—— 读 /proc/meminfo，MemAvailable 模式更准确
   - 磁盘使用率（根分区，%）
-  - 系统负载（1/5/15 分钟）
+  - 系统负载（1/5/15 分钟）—— 读 /proc/loadavg
   - Supervisor RUNNING 进程数
+  - 单进程高 CPU 占用列表
 
 每次采集后与配置阈值对比，返回告警项列表。
 告警带冷却去重：同一地区同一指标在冷却期内只报一次。
+采集失败后自动重试一次（等待 3 秒）。
 """
 from __future__ import annotations
 
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
@@ -111,49 +114,66 @@ def get_new_alerts(metrics: ServerMetrics) -> list[str]:
     return new_alerts
 
 
-# ── SSH 采集命令 ──────────────────────────────────────────────────────────────
+# ── 解析函数 ──────────────────────────────────────────────────────────────────
 
-def _parse_cpu(output: str) -> Optional[float]:
-    """解析 top -bn1 输出，返回 CPU 使用率百分比。"""
-    # 尝试匹配 "Cpu(s): 12.3 us, 4.5 sy, ... 80.1 id"
-    m = re.search(r"(\d+\.\d+)\s+id", output)
-    if m:
-        idle = float(m.group(1))
-        return round(100.0 - idle, 1)
-    # 备用：匹配 "%Cpu(s):  8.5 us"
-    m = re.search(r"%?Cpu\(s\):\s*([\d.]+)\s+us", output)
-    if m:
-        us = float(m.group(1))
-        sy_m = re.search(r"([\d.]+)\s+sy", output)
-        sy = float(sy_m.group(1)) if sy_m else 0.0
-        return round(us + sy, 1)
-    return None
+def _parse_cpu_stat(output: str) -> Optional[float]:
+    """
+    解析两次 /proc/stat 快照结果，计算 CPU 实际使用率。
+    awk 预处理后每行格式：total_jiffies  idle_jiffies
+    两行对应 0.5s 间隔的两次采样，取差值计算。
+    """
+    lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
+    if len(lines) < 2:
+        return None
+    try:
+        t1, i1 = map(float, lines[0].split())
+        t2, i2 = map(float, lines[1].split())
+        dt = t2 - t1
+        if dt <= 0:
+            return None
+        return round((1.0 - (i2 - i1) / dt) * 100, 1)
+    except (ValueError, IndexError):
+        return None
 
 
-def _parse_mem(output: str) -> Optional[float]:
-    """解析 free -m 输出，返回内存使用率百分比。"""
-    # Mem: 16000  8000  2000  ...  (total used free ...)
-    m = re.search(r"Mem:\s+(\d+)\s+(\d+)", output)
-    if m:
-        total, used = int(m.group(1)), int(m.group(2))
-        if total > 0:
-            return round(used / total * 100, 1)
+def _parse_mem_proc(output: str) -> Optional[float]:
+    """
+    解析 /proc/meminfo 输出，返回内存使用率。
+    用 MemAvailable 而非 MemFree，包含可回收缓存，更接近实际可用内存。
+    """
+    total = avail = None
+    for line in output.splitlines():
+        if line.startswith("MemTotal:"):
+            m = re.search(r"(\d+)", line)
+            if m:
+                total = int(m.group(1))
+        elif line.startswith("MemAvailable:"):
+            m = re.search(r"(\d+)", line)
+            if m:
+                avail = int(m.group(1))
+    if total and avail is not None and total > 0:
+        return round((total - avail) / total * 100, 1)
     return None
 
 
 def _parse_disk(output: str) -> Optional[float]:
-    """解析 df -h / 输出，返回使用率百分比（取数字部分）。"""
+    """解析 df 输出，返回根分区使用率百分比。"""
     m = re.search(r"(\d+)%", output)
-    if m:
-        return float(m.group(1))
-    return None
+    return float(m.group(1)) if m else None
 
 
-def _parse_load(output: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
-    """解析 uptime 输出，返回 (load1, load5, load15)。"""
-    m = re.search(r"load average[s]?:\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)", output)
-    if m:
-        return float(m.group(1)), float(m.group(2)), float(m.group(3))
+def _parse_load_proc(output: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    解析 /proc/loadavg 输出。
+    格式：1.20 1.15 1.08 2/456 12345
+    返回 (load1, load5, load15)。
+    """
+    parts = output.strip().split()
+    if len(parts) >= 3:
+        try:
+            return float(parts[0]), float(parts[1]), float(parts[2])
+        except ValueError:
+            pass
     return None, None, None
 
 
@@ -165,7 +185,6 @@ def _parse_supervisor(output: str) -> tuple[Optional[int], Optional[int]]:
     if not output.strip():
         return None, None
 
-    # 进程状态行的模式：“进程名  RUNNING/STOPPED/STARTING/...  ...”
     _STATUS_RE = re.compile(
         r"^\S+\s+(RUNNING|STOPPED|STARTING|STOPPING|EXITED|FATAL|UNKNOWN)",
         re.IGNORECASE,
@@ -189,9 +208,7 @@ def _parse_procs(output: str) -> list[dict]:
     阈值 <= 0 时直接返回空列表（功能关闭）。
     """
     threshold = settings.server_monitor_process_cpu_threshold
-    if threshold <= 0:
-        return []
-    if not output.strip():
+    if threshold <= 0 or not output.strip():
         return []
 
     results: list[dict] = []
@@ -212,49 +229,83 @@ def _parse_procs(output: str) -> list[dict]:
     return results
 
 
-# ── 单地区采集 ────────────────────────────────────────────────────────────────
+# ── 采集脚本 ──────────────────────────────────────────────────────────────────
+#
+# 改动说明（对比旧版）：
+#   CPU  —— 两次读 /proc/stat，awk 计算 total/idle jiffies，0.5s 采样间隔
+#            取代 top -bn1：跨发行版输出一致，不受终端宽度影响，更快更可靠
+#   内存 —— 读 /proc/meminfo，用 MemAvailable 而非 MemFree
+#            取代 free -m：格式固定，无表头差异问题
+#   负载 —— 读 /proc/loadavg
+#            取代 uptime：直接读内核文件，无需正则解析英文句子
+#   Supervisor —— 加 timeout 10 防止卡住整个脚本
+#   超时 —— 脚本总超时由 35s 降至 25s（节省 0.5s sleep 后还有余量）
 
 _COLLECT_SCRIPT = r"""
 echo "=CPU="
-top -bn1 2>/dev/null | grep -i "cpu(s)"
+awk 'NR==1{t=0;for(i=2;i<=NF;i++)t+=$i;print t,$5+$6}' /proc/stat
+sleep 0.5
+awk 'NR==1{t=0;for(i=2;i<=NF;i++)t+=$i;print t,$5+$6}' /proc/stat
 echo "=MEM="
-free -m 2>/dev/null | grep -i "^mem"
+grep -E '^MemTotal:|^MemAvailable:' /proc/meminfo
 echo "=DISK="
-df -h / 2>/dev/null | tail -1
+df / 2>/dev/null | tail -1
 echo "=LOAD="
-uptime 2>/dev/null
+cat /proc/loadavg
 echo "=SUPERVISOR="
-sudo supervisorctl status 2>&1; true
+timeout 10 sudo supervisorctl status 2>&1; true
 echo "=PROCS="
 ps -eo pid,comm,%cpu --sort=-%cpu 2>/dev/null | head -16
 """.strip()
 
 
-def collect(region: str) -> ServerMetrics:
-    """SSH 到指定地区执行采集脚本，解析并返回 ServerMetrics。"""
+# ── 单地区采集 ────────────────────────────────────────────────────────────────
+
+def _do_collect(region: str) -> ServerMetrics:
+    """执行一次采集，不含重试逻辑。抛出异常由 collect() 处理。"""
     m = ServerMetrics(region)
-    try:
-        rc, output = _ssh.execute(_COLLECT_SCRIPT, region, timeout=35)
-        sections = _split_sections(output)
+    rc, output = _ssh.execute(_COLLECT_SCRIPT, region, timeout=25)
+    sections = _split_sections(output)
 
-        m.cpu_percent = _parse_cpu(sections.get("CPU", ""))
-        m.mem_percent = _parse_mem(sections.get("MEM", ""))
-        m.disk_percent = _parse_disk(sections.get("DISK", ""))
-        m.load_1, m.load_5, m.load_15 = _parse_load(sections.get("LOAD", ""))
-        m.supervisor_running, m.supervisor_total = _parse_supervisor(sections.get("SUPERVISOR", ""))
-        m.process_high_cpu = _parse_procs(sections.get("PROCS", ""))
+    m.cpu_percent             = _parse_cpu_stat(sections.get("CPU", ""))
+    m.mem_percent             = _parse_mem_proc(sections.get("MEM", ""))
+    m.disk_percent            = _parse_disk(sections.get("DISK", ""))
+    m.load_1, m.load_5, m.load_15 = _parse_load_proc(sections.get("LOAD", ""))
+    m.supervisor_running, m.supervisor_total = _parse_supervisor(sections.get("SUPERVISOR", ""))
+    m.process_high_cpu        = _parse_procs(sections.get("PROCS", ""))
 
-        logger.debug(
-            "[monitor] %s 采集完成 cpu=%.1f%% mem=%.1f%% disk=%.1f%% high_cpu_procs=%d",
-            region,
-            m.cpu_percent or 0,
-            m.mem_percent or 0,
-            m.disk_percent or 0,
-            len(m.process_high_cpu),
-        )
-    except Exception as e:
-        m.error = str(e)
-        logger.warning("[monitor] %s 采集失败: %s", region, e)
+    logger.debug(
+        "[monitor] %s 采集完成 cpu=%.1f%% mem=%.1f%% disk=%.1f%% high_cpu_procs=%d",
+        region,
+        m.cpu_percent or 0,
+        m.mem_percent or 0,
+        m.disk_percent or 0,
+        len(m.process_high_cpu),
+    )
+    return m
+
+
+def collect(region: str) -> ServerMetrics:
+    """
+    SSH 到指定地区执行采集脚本，解析并返回 ServerMetrics。
+    失败后自动等 3 秒重试一次，再次失败才标记 error。
+    """
+    for attempt in range(2):
+        try:
+            return _do_collect(region)
+        except Exception as e:
+            if attempt == 0:
+                logger.warning("[monitor] %s 第1次采集失败，3秒后重试: %s", region, e)
+                time.sleep(3)
+            else:
+                m = ServerMetrics(region)
+                m.error = str(e)
+                logger.error("[monitor] %s 采集失败（已重试）: %s", region, e)
+                return m
+
+    # 理论上不会走到这里
+    m = ServerMetrics(region)
+    m.error = "unknown error"
     return m
 
 
@@ -265,7 +316,7 @@ def _split_sections(output: str) -> dict[str, str]:
     current_lines: list[str] = []
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.startswith("=") and stripped.endswith("="):
+        if stripped.startswith("=") and stripped.endswith("=") and len(stripped) > 2:
             if current_key:
                 sections[current_key] = "\n".join(current_lines).strip()
             current_key = stripped[1:-1]
