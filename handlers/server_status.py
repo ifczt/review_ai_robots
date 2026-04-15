@@ -2,7 +2,7 @@
 服务器状态监控处理器。
 
 负责：
-  1. 巡检播报 — 采集 → AI 汇总 → 发送到监控群
+  1. 巡检播报 — 采集 → 生成图表图片 → 发送到监控群
   2. 告警发送 — 单独格式化超阈值告警消息
   3. 每日汇报 — 聚合当天所有巡检数据 → AI 汇总 → 发送
   4. 指标历史记录 — 保留当天所有巡检快照供每日汇报使用
@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 from collections import defaultdict
 from datetime import date, datetime
@@ -23,9 +24,10 @@ from typing import Optional
 from ai import client as ai_client
 from ai.prompts import SERVER_MONITOR_PATROL_PROMPT, SERVER_MONITOR_DAILY_REPORT_PROMPT
 from config import settings
+from infra import server_report_image as _report_image
 from infra import server_monitor as _mon
 from infra import ssh as _ssh
-from infra.feishu import send_text
+from infra.feishu import send_image, send_text
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,66 @@ def _ai_patrol_report(patrol_input: str) -> str:
     return f"🖥️ 服务器巡检播报 · {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n{patrol_input}"
 
 
+def _metric_alert_names(m: _mon.ServerMetrics) -> list[str]:
+    """返回当前服务器命中的巡检告警项。"""
+    if not m.ok:
+        return []
+
+    alerts: list[str] = []
+    if m.cpu_percent is not None and m.cpu_percent >= settings.server_monitor_cpu_threshold:
+        alerts.append("CPU")
+    if m.mem_percent is not None and m.mem_percent >= settings.server_monitor_mem_threshold:
+        alerts.append("MEM")
+    if m.disk_percent is not None and m.disk_percent >= settings.server_monitor_disk_threshold:
+        alerts.append("DISK")
+    if m.process_high_cpu:
+        alerts.append("PROC")
+    return alerts
+
+
+def _metric_state(m: _mon.ServerMetrics) -> str:
+    if not m.ok:
+        return "fail"
+    if _metric_alert_names(m):
+        return "warn"
+    return "ok"
+
+def _summary_text(metrics_list: list[_mon.ServerMetrics]) -> str:
+    ok_count = sum(1 for m in metrics_list if _metric_state(m) == "ok")
+    warn_count = sum(1 for m in metrics_list if _metric_state(m) == "warn")
+    fail_count = sum(1 for m in metrics_list if _metric_state(m) == "fail")
+
+    if fail_count:
+        headline = f"存在 {fail_count} 个地区采集失败，请关注异常项。"
+    elif warn_count:
+        headline = f"发现 {warn_count} 个地区触发告警阈值，请优先排查。"
+    else:
+        headline = "整体正常，当前各地区未见告警指标。"
+
+    proc_threshold = (
+        f"PROC>={settings.server_monitor_process_cpu_threshold}%"
+        if settings.server_monitor_process_cpu_threshold > 0
+        else "PROC=OFF"
+    )
+
+    return (
+        f"{headline}\n"
+        f"正常 {ok_count} | 告警 {warn_count} | 失败 {fail_count}\n"
+        f"阈值 CPU>={settings.server_monitor_cpu_threshold}% / "
+        f"MEM>={settings.server_monitor_mem_threshold}% / "
+        f"DISK>={settings.server_monitor_disk_threshold}% / "
+        f"{proc_threshold}"
+    )
+
+
+def _fallback_patrol_text(metrics_list: list[_mon.ServerMetrics], patrol_input: str) -> str:
+    return (
+        f"🖥️ 服务器巡检播报 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"{_summary_text(metrics_list)}\n\n"
+        f"{patrol_input}"
+    )
+
+
 def _build_alert_text(m: _mon.ServerMetrics, new_alerts: list[str]) -> str:
     """格式化告警消息。"""
     cpu_t = settings.server_monitor_cpu_threshold
@@ -154,7 +216,7 @@ def send_patrol_report() -> None:
     """
     执行一次完整巡检：
       1. 并发采集所有地区指标
-      2. AI 汇总 → 发送巡检播报到监控群
+      2. 生成图表图片 → 发送巡检结果到监控群
       3. 检查告警（带冷却去重）→ 发送独立告警消息
     """
     chat_id = _get_monitor_chat_id()
@@ -171,10 +233,20 @@ def send_patrol_report() -> None:
         _last_patrol.clear()
         _last_patrol.extend(metrics_list)
 
-    # AI 汇总播报
     patrol_input = _build_patrol_input(metrics_list)
-    report_text = _ai_patrol_report(patrol_input)
-    send_text(chat_id, report_text)
+    image_path = None
+    image_sent = False
+    try:
+        image_path = _report_image.render_patrol_image(metrics_list)
+        image_sent = send_image(chat_id, str(image_path))
+    except Exception as e:
+        logger.exception("[server_status] 巡检图片生成或发送失败: %s", e)
+    finally:
+        if image_path:
+            shutil.rmtree(image_path.parent, ignore_errors=True)
+
+    if not image_sent:
+        send_text(chat_id, _fallback_patrol_text(metrics_list, patrol_input))
 
     # 逐地区检查告警
     for m in metrics_list:

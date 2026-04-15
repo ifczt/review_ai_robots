@@ -11,6 +11,8 @@ __pycache__/
 build/
 dist/
 *.spec.bak
+node_modules/
+tools/server_monitor_chart/.cache/
 
 data/*
 !data/.gitkeep

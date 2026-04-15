@@ -20,9 +20,10 @@ logger = logging.getLogger(__name__)
 HELP_TEXT = """可用命令：
 /sql <地区>.<库名> <SQL>          - 提交 SQL 审核并执行（生产环境）
 /gitreview <PR链接>               - AI 审查 Gitea PR，通过则自动合并
-/freeze on [原因]                 - 开启封版（仅 BUG 修复 PR 可合并）
-/freeze off                       - 解除封版
-/freeze                           - 查看封版状态
+/freeze on <项目> [原因]          - 开启项目封版（项目格式：repo 或 owner/repo）
+/freeze off <项目>                - 解除项目封版
+/freeze <项目>                    - 查看指定项目封版状态
+/freeze                           - 查看全局与项目封版状态
 /testlist                         - 查询当前所有待测试任务（上线前确认）
 /svc <地区> <子命令> [服务名]     - 远程管理 supervisor 服务进程
 /svc <地区> nginx <操作>          - 远程管理 nginx（操作：status/start/stop/restart/reload/test）
@@ -37,6 +38,7 @@ HELP_TEXT = """可用命令：
 示例：
   /sql sa.user SELECT * FROM users WHERE id=1
   /gitreview https://gitea.example.com/owner/repo/pulls/42
+  /freeze on bigwin_admin 发布前封版
   /svc sa status
   /svc sa restart grpc_notice_hook
   /svc sa tail grpc_notice_hook
@@ -64,6 +66,8 @@ _SQL_BARE_RE = re.compile(
     r"(SELECT\b.+|INSERT\b.+|UPDATE\b.+|DELETE\b.+|SHOW\b.+|EXPLAIN\b.+|DESC(?:RIBE)?\b.+|ALTER\s+TABLE\b.+|CREATE\s+TABLE\b.+)",
     re.IGNORECASE | re.DOTALL,
 )
+
+_FREEZE_PROJECT_RE = re.compile(r"^[^/\s]+(?:/[^/\s]+)?$")
 
 
 def has_pending(user_id: str) -> bool:
@@ -134,15 +138,42 @@ def dispatch(text: str, chat_id: str, user_id: str) -> None:
 
     # ── /freeze 命令（封版开关）────────────────────────────────────
     if stripped.startswith("/freeze"):
-        args = stripped[7:].strip().split(None, 1)
-        sub = args[0].lower() if args else "status"
+        payload = stripped[7:].strip()
+        if not payload:
+            send_text(chat_id, _freeze.status_text())
+            return
+
+        args = payload.split(None, 1)
+        sub = args[0].lower()
+        rest = args[1].strip() if len(args) > 1 else ""
+
         if sub == "on":
-            reason = args[1] if len(args) > 1 else ""
-            _freeze.enable(reason)
-            send_text(chat_id, _freeze.status_text())
+            project = None
+            reason = ""
+            if rest:
+                project_candidate, _, trailing = rest.partition(" ")
+                if _FREEZE_PROJECT_RE.fullmatch(project_candidate):
+                    project = project_candidate
+                    reason = trailing.strip()
+                else:
+                    reason = rest
+            _freeze.enable(reason, project=project)
+            send_text(chat_id, _freeze.status_text(project))
         elif sub == "off":
-            _freeze.disable()
-            send_text(chat_id, _freeze.status_text())
+            project = rest or None
+            if project and not _FREEZE_PROJECT_RE.fullmatch(project):
+                send_text(chat_id, "用法：/freeze off <项目>\n项目格式：repo 或 owner/repo")
+                return
+            _freeze.disable(project=project)
+            send_text(chat_id, _freeze.status_text(project))
+        elif sub == "status":
+            project = rest or None
+            if project and not _FREEZE_PROJECT_RE.fullmatch(project):
+                send_text(chat_id, "用法：/freeze status <项目>\n项目格式：repo 或 owner/repo")
+                return
+            send_text(chat_id, _freeze.status_text(project))
+        elif _FREEZE_PROJECT_RE.fullmatch(sub) and not rest:
+            send_text(chat_id, _freeze.status_text(sub))
         else:
             send_text(chat_id, _freeze.status_text())
         return

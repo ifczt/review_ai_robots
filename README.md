@@ -85,8 +85,10 @@ python main.py
 | --- | --- |
 | `/sql <地区>.<库名> <SQL>` | 触发 SQL 审核，审核通过后等待人工确认执行 |
 | `/gitreview <PR链接>` | 审查 Gitea PR，通过时可自动合并 |
-| `/freeze on [原因]` | 开启封版，只允许 bugfix PR 自动合并 |
-| `/freeze off` | 解除封版 |
+| `/freeze on <项目> [原因]` | 开启项目封版，只影响指定项目（格式：`repo` 或 `owner/repo`） |
+| `/freeze off <项目>` | 解除指定项目封版 |
+| `/freeze <项目>` | 查看指定项目封版状态 |
+| `/freeze` | 查看全局与所有项目封版状态 |
 | `/svc <地区> <子命令>` | 远程执行 `supervisorctl` |
 | `/run <命令>` | 执行本地只读诊断命令 |
 | `/testlist` | 查看当前待测试任务 |
@@ -101,7 +103,7 @@ python main.py
 ```text
 /sql sa.user SELECT * FROM users WHERE id = 1
 /gitreview https://gitea.example.com/owner/repo/pulls/42
-/freeze on 发布前封版
+/freeze on bigwin_admin 发布前封版
 /svc sa status
 /svc sa restart grpc_notice_hook
 /run git status
@@ -164,7 +166,8 @@ key_path = "IFCZT_KEYS"
 2. 机器人拉取 PR 信息和 diff
 3. AI 输出 `[APPROVE]` / `[REQUEST_CHANGES]` / `[REJECT]`
 4. 通过时自动合并，不通过时回写 Gitea 评论
-5. 合并成功后可自动创建测试计划并通知 BW 群
+5. 如果目标项目处于封版状态，则仅允许 BUG 修复类 PR 继续自动合并
+6. 合并成功后可自动创建测试计划并通知 BW 群
 
 ### 每日审查日报
 

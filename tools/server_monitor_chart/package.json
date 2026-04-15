@@ -1,0 +1,17 @@
+{
+  "name": "server-monitor-chart",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Render concise server patrol charts with BizCharts and capture them as PNG.",
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "dependencies": {
+    "bizcharts": "4.1.23",
+    "esbuild": "0.25.11",
+    "playwright-core": "1.59.1",
+    "react": "16.14.0",
+    "react-dom": "16.14.0"
+  }
+}

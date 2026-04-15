@@ -68,6 +68,7 @@ def handle(chat_id: str, user_id: str, pr_url: str) -> None:
     owner = m.group(2)
     repo = m.group(3)
     index = int(m.group(4))
+    project = f"{owner}/{repo}"
 
     # ── 获取 PR 元信息 ───────────────────────────────────────────
     try:
@@ -96,12 +97,18 @@ def handle(chat_id: str, user_id: str, pr_url: str) -> None:
         return
 
     # ── 封版检查 ─────────────────────────────────────────────────
-    if freeze.is_frozen() and not freeze.is_bugfix_pr(title, pr_body):
-        reason = freeze.get_reason()
+    active_freeze = freeze.get_active_freeze(project)
+    if active_freeze and not freeze.is_bugfix_pr(title, pr_body):
+        scope_text = (
+            f"项目「{project}」"
+            if active_freeze["scope"] == "project"
+            else "全局"
+        )
+        reason = active_freeze.get("reason", "")
         reason_part = f"\n原因：{reason}" if reason else ""
         send_text(
             chat_id,
-            f"🔒 当前处于封版状态，PR #{index}「{title}」不属于 BUG 修复，已拒绝合并。{reason_part}",
+            f"🔒 当前{scope_text}处于封版状态，PR #{index}「{title}」不属于 BUG 修复，已拒绝合并。{reason_part}",
         )
         return
 
@@ -189,7 +196,7 @@ def handle(chat_id: str, user_id: str, pr_url: str) -> None:
                 pr_author = pr.get("user", {}).get("login", "unknown")
                 threading.Thread(
                     target=test_plan.create_session,
-                    args=(index, title, diff, chat_id, pr_author, user_id),
+                    args=(index, project, title, diff, chat_id, pr_author, user_id),
                     daemon=True,
                 ).start()
         except Exception as e:

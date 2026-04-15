@@ -9,7 +9,7 @@ PR 合并后自动触发，AI 从 diff 提取测试要点，
 服务重启后自动恢复未完成的测试任务。
 
 公开接口：
-  create_session(pr_index, pr_title, diff, source_chat_id,
+  create_session(pr_index, project_name, pr_title, diff, source_chat_id,
                  pr_author="", initiator_id="") -> None
   handle_reply(text, chat_id, user_id) -> None
   has_active_session() -> bool
@@ -51,6 +51,7 @@ class TestPlanSession:
     session_id: str
     source_chat_id: str      # /gitreview 所在群，最终报告目标
     pr_index: int
+    project_name: str
     pr_title: str
     pr_author: str           # Gitea PR 作者
     initiator_id: str        # 触发审查的飞书用户 open_id
@@ -84,6 +85,7 @@ def _ensure_table() -> None:
                 session_id      TEXT    PRIMARY KEY,
                 source_chat_id  TEXT    NOT NULL,
                 pr_index        INTEGER NOT NULL,
+                project_name    TEXT    NOT NULL DEFAULT '',
                 pr_title        TEXT    NOT NULL,
                 pr_author       TEXT    NOT NULL DEFAULT '',
                 initiator_id    TEXT    NOT NULL DEFAULT '',
@@ -95,6 +97,14 @@ def _ensure_table() -> None:
                 finished_at     REAL    NOT NULL DEFAULT 0.0
             )
         """)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(test_plan_sessions)").fetchall()
+        }
+        if "project_name" not in columns:
+            conn.execute(
+                "ALTER TABLE test_plan_sessions ADD COLUMN project_name TEXT NOT NULL DEFAULT ''"
+            )
         conn.commit()
 
 
@@ -104,14 +114,15 @@ def _save_session(session: TestPlanSession) -> None:
         with _get_conn() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO test_plan_sessions
-                   (session_id, source_chat_id, pr_index, pr_title, pr_author,
+                   (session_id, source_chat_id, pr_index, project_name, pr_title, pr_author,
                     initiator_id, points, accepted, rejected,
                     created_at, last_handler_id, finished_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session.session_id,
                     session.source_chat_id,
                     session.pr_index,
+                    session.project_name,
                     session.pr_title,
                     session.pr_author,
                     session.initiator_id,
@@ -156,6 +167,7 @@ def _load_sessions() -> None:
                 session_id=r["session_id"],
                 source_chat_id=r["source_chat_id"],
                 pr_index=r["pr_index"],
+                project_name=r["project_name"] or "",
                 pr_title=r["pr_title"],
                 pr_author=r["pr_author"],
                 initiator_id=r["initiator_id"],
@@ -205,8 +217,10 @@ def get_pending_summary() -> str:
             if (i + 1) not in s.accepted
         ]
         status = f"{done}/{total} 已通过" if done > 0 else "待开始"
+        project_line = f"  项目：{s.project_name}\n" if s.project_name else ""
         lines.append(
             f"▸ PR #{s.pr_index}  {s.pr_title}\n"
+            f"{project_line}"
             f"  发起人：{s.pr_author}　发起时间：{_fmt_time(s.created_at)}\n"
             f"  进度：{status}\n"
             + ("  待验收要点：\n" + "\n".join(remaining) if remaining else "  所有要点已通过，等待确认")
@@ -216,6 +230,7 @@ def get_pending_summary() -> str:
 
 def create_session(
     pr_index: int,
+    project_name: str,
     pr_title: str,
     diff: str,
     source_chat_id: str,
@@ -242,6 +257,7 @@ def create_session(
         session_id=session_id,
         source_chat_id=source_chat_id,
         pr_index=pr_index,
+        project_name=project_name.strip(),
         pr_title=pr_title,
         pr_author=pr_author or "unknown",
         initiator_id=initiator_id,
@@ -350,7 +366,10 @@ def _resolve_session(pr_hint: int | None, chat_id: str) -> "TestPlanSession | No
         return next(iter(active.values()))
 
     # 多任务，未指定 PR 编号
-    items = "\n".join(f"  PR #{idx}: {s.pr_title}" for idx, s in sorted(active.items()))
+    items = "\n".join(
+        f"  PR #{idx}: {s.project_name + ' / ' if s.project_name else ''}{s.pr_title}"
+        for idx, s in sorted(active.items())
+    )
     send_text(
         chat_id,
         f"当前有 {len(active)} 个并发测试任务，请在回复中指定 PR 编号，例如：\n"
@@ -398,14 +417,17 @@ def _send_bw_notification(session: TestPlanSession) -> None:
             f"  拒绝 2 页面404    —— 拒绝要点，可附原因"
         )
 
-    msg = (
-        f"【测试通知】PR #{session.pr_index} 已合并，请进行测试验证\n\n"
-        f"PR 标题：{session.pr_title}\n"
-        f"发起人：{session.pr_author}\n"
-        f"发起时间：{_fmt_time(session.created_at)}\n\n"
-        f"测试要点：\n{points_text}\n\n"
-        f"回复格式：\n{reply_hint}"
-    )
+    parts = [f"【测试通知】PR #{session.pr_index} 已合并，请进行测试验证\n"]
+    if session.project_name:
+        parts.append(f"项目名称：{session.project_name}\n")
+    parts.extend([
+        f"PR 标题：{session.pr_title}\n",
+        f"发起人：{session.pr_author}\n",
+        f"发起时间：{_fmt_time(session.created_at)}\n",
+        f"\n测试要点：\n{points_text}\n\n",
+        f"回复格式：\n{reply_hint}",
+    ])
+    msg = "".join(parts)
     send_text(settings.bw_chat_id, msg)
 
 
@@ -416,14 +438,19 @@ def _on_all_accepted(session: TestPlanSession) -> None:
     points_summary = "\n".join(
         f"{i + 1}. {p} ✓" for i, p in enumerate(session.points)
     )
-    send_text(
-        session.source_chat_id,
-        f"✅ PR #{session.pr_index} 测试通过，可以发布生产环境\n\n"
-        f"测试要点（{total}/{total} 通过）：\n{points_summary}\n\n"
-        f"处理人：{session.last_handler_id or 'BW群成员'}\n"
+    parts = [f"✅ PR #{session.pr_index} 测试通过，可以发布生产环境\n\n"]
+    if session.project_name:
+        parts.append(f"项目名称：{session.project_name}\n")
+    parts.extend([
+        f"测试要点（{total}/{total} 通过）：\n{points_summary}\n\n",
+        f"处理人：{session.last_handler_id or 'BW群成员'}\n",
         f"处理时间：{_fmt_time(session.finished_at)}",
-    )
-    send_text(settings.bw_chat_id, f"PR #{session.pr_index} 全部测试要点已通过，已通知发布方。")
+    ])
+    send_text(session.source_chat_id, "".join(parts))
+    bw_msg = f"PR #{session.pr_index} 全部测试要点已通过，已通知发布方。"
+    if session.project_name:
+        bw_msg = f"项目 {session.project_name} 的 {bw_msg}"
+    send_text(settings.bw_chat_id, bw_msg)
     _sessions.pop(session.session_id, None)
     _delete_session_db(session.session_id)
     logger.info("[test_plan] PR #%d 测试全部通过", session.pr_index)
@@ -435,25 +462,25 @@ def _on_rejected(session: TestPlanSession, point_num: int, reason: str) -> None:
     session.finished_at = time.time()
     point_text = session.points[point_num - 1]
     reason_display = reason if reason else "（未说明）"
-    send_text(
-        session.source_chat_id,
-        f"❌ PR #{session.pr_index} 测试未通过，暂不可发布\n\n"
-        f"失败要点：#{point_num} {point_text}\n"
-        f"拒绝原因：{reason_display}\n\n"
-        f"处理人：{session.last_handler_id or 'BW群成员'}\n"
-        f"处理时间：{_fmt_time(session.finished_at)}\n\n"
-        f"请修复后重新提交 PR。",
-    )
-    send_text(
-        settings.bw_chat_id,
-        f"PR #{session.pr_index} 测试中止：要点 #{point_num} 被拒绝，已通知发布方。",
-    )
+    parts = [f"❌ PR #{session.pr_index} 测试未通过，暂不可发布\n\n"]
+    if session.project_name:
+        parts.append(f"项目名称：{session.project_name}\n")
+    parts.extend([
+        f"失败要点：#{point_num} {point_text}\n",
+        f"拒绝原因：{reason_display}\n\n",
+        f"处理人：{session.last_handler_id or 'BW群成员'}\n",
+        f"处理时间：{_fmt_time(session.finished_at)}\n\n",
+        "请修复后重新提交 PR。",
+    ])
+    send_text(session.source_chat_id, "".join(parts))
+    bw_msg = f"PR #{session.pr_index} 测试中止：要点 #{point_num} 被拒绝，已通知发布方。"
+    if session.project_name:
+        bw_msg = f"项目 {session.project_name} 的 {bw_msg}"
+    send_text(settings.bw_chat_id, bw_msg)
     _sessions.pop(session.session_id, None)
     _delete_session_db(session.session_id)
     logger.info(
         "[test_plan] PR #%d 测试被拒绝 point=%d reason=%r",
         session.pr_index, point_num, reason,
     )
-
-
 
